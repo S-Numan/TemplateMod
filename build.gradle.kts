@@ -497,7 +497,7 @@ val jbrLauncher = javaToolchains.launcherFor {
 //configures Shenandoah. Drop the Shenandoah-specific flags so JBR falls back to its
 //default (G1). Only affects these gradle tasks; the in-game launcher (vmparams) is
 //untouched, so normal runs still use Shenandoah.
-fun List<String>.forJbr(): List<String> = filterNot { it.contains("Shenandoah") }
+fun List<String>.forJbr(): List<String> = filterNot { it.contains("Shenandoah") || it.contains("PrintCodeCache") }
 
 //Builds the mod jar, then runs Starsector using the same classpath/jvmArgs the launcher would use.
 tasks.register<JavaExec>("runStarsector") {
