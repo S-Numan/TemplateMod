@@ -1,11 +1,3 @@
-import java.net.HttpURLConnection
-import java.net.URL
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
-
 //Automatically points to the starsector folder if the mod is placed in to the "mods" folder.
 //If you do not place the project in to your mods folder, replace this with the path to Starsectors root folder.
 val starsectorPath= "../../";
@@ -98,12 +90,6 @@ val javaVersion = 17
 /// BUILD PIPELINE
 /// In Most cases, you should not need to change anything below here.
 
-//Community API docs source. Declared here so they're set before the staging call after repositories{}.
-val communityDocsRepo = "StarsectorCommunityApiDocs/CommunityApiDocs"
-val communityDocsBranch = "gh-pages"
-//How stale the staged docs may get before we re-check the published SHA. Larger = fewer network round-trips.
-val javadocCheckIntervalDays = 7L
-
 dependencies {
     addModJars(modDependencies)
     otherDependencies.forEach { addCompileOnlyJar(it) }
@@ -164,11 +150,6 @@ idea {
     module {
         outputDir = file("build/idea-out/main")
         testOutputDir = file("build/idea-out/test")
-
-        // IntelliJ's Gradle import resolves -sources.jar but not -javadoc.jar by default; enable both so it
-        // attaches the community "-javadoc.jar" staged below.
-        isDownloadSources = true
-        isDownloadJavadoc = true
     }
 }
 
@@ -179,19 +160,6 @@ repositories {
     //Local Maven repo of staged Starsector API artifacts. The maven layout (vs flatDir) is what
     //actually lets IntelliJ pick up the "-sources.jar" sibling for autocomplete and navigation.
     maven { url = uri(stageStarsectorApi()) }
-}
-
-//Stage the community javadoc next to the API jar (see stageCommunityApiJavadoc). Best-effort: never fails the
-//build. Skipped on CI, which has no build/ cache and would re-download ~37MB every run.
-runCatching {
-    if (System.getenv("CI") != "true") {
-        providers.of(TimeBucketSource::class.java) {
-            parameters.intervalMillis.set(javadocCheckIntervalDays * 24 * 60 * 60 * 1_000)
-        }.get()
-        stageCommunityApiJavadoc()
-    }
-}.onFailure { e ->
-    logger.warn("Could not stage community API javadoc (non-fatal): ${e.message}")
 }
 
 // Apply a specific Java toolchain to ease working on different environments.
@@ -333,15 +301,6 @@ abstract class FileMtimeSource : ValueSource<Long, FileMtimeSource.Parameters> {
     }
 }
 
-//Current time floored into intervalMillis-wide buckets. Reading it during configuration ties the bucket into
-//the config cache, so a new bucket invalidates the cache and lets staging re-check the docs once per interval.
-abstract class TimeBucketSource : ValueSource<Long, TimeBucketSource.Parameters> {
-    interface Parameters : ValueSourceParameters {
-        val intervalMillis: Property<Long>
-    }
-    override fun obtain(): Long = System.currentTimeMillis() / parameters.intervalMillis.get().coerceAtLeast(1L)
-}
-
 //Stages the Starsector API as a local Maven repo under build/starsector-api/.
 //Using a maven layout (not flatDir) because IntelliJ only reliably attaches sources when the
 //artifact has a POM and follows the standard "<name>-<version>-sources.jar" classifier convention.
@@ -403,83 +362,6 @@ fun stageStarsectorApi(): File {
         )
     }
     return repoDir
-}
-
-/// COMMUNITY API JAVADOC
-/// Stages the community API docs (https://starsectorcommunityapidocs.github.io/CommunityApiDocs/) as a
-/// "-javadoc.jar" beside the API jar so IntelliJ shows them on Quick Documentation. Built from the docs'
-/// published `gh-pages` branch; refreshed when that branch's commit changes (re-checked once per interval).
-
-//Returns the docs branch's latest commit SHA via GitHub's ".sha" media type (bare text, no parsing).
-//Returns null on any failure so callers keep whatever is already staged. The hex check tolerates a future
-//switch to longer SHA-256 hashes and rejects any error page returned instead of a SHA.
-fun fetchCommunityDocsSha(): String? = try {
-    val conn = URL("https://api.github.com/repos/$communityDocsRepo/commits/$communityDocsBranch")
-        .openConnection() as HttpURLConnection
-    conn.connectTimeout = 5_000
-    conn.readTimeout = 5_000
-    conn.setRequestProperty("Accept", "application/vnd.github.sha")
-    conn.inputStream.bufferedReader().use { it.readText().trim() }.takeIf { it.matches(Regex("[0-9a-fA-F]{7,64}")) }
-} catch (e: Exception) {
-    null
-}
-
-//Downloads the docs branch zip and rewrites it into outJar: strips GitHub's "<repo>-<branch>/" wrapper folder
-//(so index.html sits at the jar root) and drops the large "src-html/" tree (we already attach real sources).
-fun downloadAndRepackageCommunityJavadoc(outJar: File) {
-    //Documented "Download ZIP" URL; 302-redirects to codeload, which HttpURLConnection follows automatically.
-    val zipUrl = "https://github.com/$communityDocsRepo/archive/refs/heads/$communityDocsBranch.zip"
-    val tmpZip = File.createTempFile("community-api-docs", ".zip")
-    try {
-        val conn = URL(zipUrl).openConnection() as HttpURLConnection
-        conn.connectTimeout = 5_000
-        conn.readTimeout = 60_000
-        conn.inputStream.use { input -> tmpZip.outputStream().use { input.copyTo(it) } }
-
-        ZipFile(tmpZip).use { zip ->
-            ZipOutputStream(outJar.outputStream().buffered()).use { out ->
-                for (entry in zip.entries()) {
-                    if (entry.isDirectory) continue
-                    val rel = entry.name.substringAfter('/') // strip the "<repo>-<branch>/" prefix
-                    if (rel.isEmpty() || rel.startsWith("src-html/")) continue
-                    out.putNextEntry(ZipEntry(rel))
-                    zip.getInputStream(entry).use { it.copyTo(out) }
-                    out.closeEntry()
-                }
-            }
-        }
-    } finally {
-        tmpZip.delete()
-    }
-}
-
-//Makes starfarer-api-local-javadoc.jar match the published docs. Does no network work when the staged SHA
-//already matches; downloads into a .part file and only then swaps it in, so any failure keeps the existing jar.
-fun stageCommunityApiJavadoc() {
-    val artifactDir = layout.buildDirectory.dir("starsector-api/com/fs/starfarer/starfarer-api/local").get().asFile
-    val jar = File(artifactDir, "starfarer-api-local-javadoc.jar")
-    val shaFile = File(artifactDir, "starfarer-api-local-javadoc.sha")
-    val tmpJar = File(artifactDir, "starfarer-api-local-javadoc.jar.part")
-
-    val remoteSha = fetchCommunityDocsSha()
-    if (remoteSha == null) {
-        if (!jar.exists()) logger.lifecycle("Community API javadoc: offline; will retry on a later sync.")
-        return
-    }
-
-    val localSha = shaFile.takeIf { it.exists() }?.readText()?.trim()
-    if (jar.exists() && localSha == remoteSha) return // already current
-
-    artifactDir.mkdirs()
-    tmpJar.delete()
-    logger.lifecycle("Community API javadoc: fetching enhanced docs (~37MB, one-time)...")
-    downloadAndRepackageCommunityJavadoc(tmpJar)
-
-    //Swap in the new jar only after a fully written .part file. Files.move throws (rather than silently
-    //deleting the old jar) if it can't replace the target, leaving the previous jar and SHA untouched.
-    Files.move(tmpJar.toPath(), jar.toPath(), StandardCopyOption.REPLACE_EXISTING)
-    shaFile.writeText(remoteSha)
-    logger.lifecycle("Community API javadoc: staged docs @ ${remoteSha.take(8)}.")
 }
 
 data class StarsectorLaunchSpec(
