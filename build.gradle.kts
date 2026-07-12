@@ -153,6 +153,12 @@ idea {
     }
 }
 
+//Local Maven repo where mod-dependency jars get staged, along with a matching "-sources.jar"
+//(see stageModDependency / addModJars below). Declared up here (rather than next to docsRepoDir)
+//because it needs to be initialized before the dependencies{} block runs, which happens earlier
+//in this file.
+val modDepsRepoDir = layout.buildDirectory.dir("modDepsRepo").get().asFile
+
 repositories {
     // Use Maven Central for resolving dependencies.
     mavenCentral()
@@ -160,6 +166,12 @@ repositories {
     //Local Maven repo of staged Starsector API artifacts. The maven layout (vs flatDir) is what
     //actually lets IntelliJ pick up the "-sources.jar" sibling for autocomplete and navigation.
     maven { url = uri(stageStarsectorApi()) }
+
+    //Local Maven repo of staged mod-dependency jars (see addModJars/stageModDependency). Same trick as
+    //above: each mod jar is also staged under a matching "-sources.jar" name so IntelliJ attaches
+    //docs/navigation for it. Starsector mod jars already bundle their .java/.kt source files
+    //alongside the .class files, so the jar itself works fine as its own "sources" jar.
+    maven { url = uri(modDepsRepoDir) }
 }
 
 // Apply a specific Java toolchain to ease working on different environments.
@@ -213,10 +225,10 @@ fun DependencyHandler.addModJars(jarNames: List<String>) {
         files()
     }
 
-    val allJarFiles = modJarFiles + libsJarFiles
+    val allJarFiles = (modJarFiles + libsJarFiles).files
 
     // Realize the file tree once to detect missing entries.
-    val foundNames = allJarFiles.files.map { it.name }.toSet()
+    val foundNames = allJarFiles.map { it.name }.toSet()
     jarNames.filterNot { it in foundNames }.forEach { missing ->
         logger.error(
             "Mod dependency '$missing' was not found in any mod's " +
@@ -225,7 +237,72 @@ fun DependencyHandler.addModJars(jarNames: List<String>) {
         )
     }
 
-    compileOnly(allJarFiles)
+    // A jar name could theoretically be found more than once (e.g. present in both the mods
+    // folder and the libs folder) - keep only the first match per filename.
+    allJarFiles.distinctBy { it.name }.forEach { jarFile ->
+        compileOnly(stageModDependency(jarFile))
+    }
+}
+
+//Stages a mod-dependency jar as a local Maven artifact under modDepsRepoDir, so it can be added
+//as "modjars:<jarBaseName>:local". This mirrors stageStarsectorApi() below: the maven layout +
+//"-sources.jar" naming convention is what lets IntelliJ automatically attach sources/docs for a
+//compileOnly dependency.
+//Starsector mod jars typically bundle their .java/.kt source files alongside the .class files
+//in the same jar.
+fun stageModDependency(jarFile: File): String {
+    val jarBaseName = jarFile.nameWithoutExtension
+    val artifactDir = File(modDepsRepoDir, "modjars/$jarBaseName/local")
+    val dstJar = File(artifactDir, "$jarBaseName-local.jar")
+    val dstSources = File(artifactDir, "$jarBaseName-local-sources.jar")
+    val pomFile = File(artifactDir, "$jarBaseName-local.pom")
+
+    artifactDir.mkdirs()
+
+    if (!dstJar.exists() || dstJar.lastModified() < jarFile.lastModified()) {
+        jarFile.copyTo(dstJar, overwrite = true)
+    }
+
+    if (!dstSources.exists() || dstSources.lastModified() < jarFile.lastModified()) {
+        extractSourceEntriesOnly(jarFile, dstSources)
+    }
+
+    if (!pomFile.exists()) {
+        pomFile.writeIfChanged(
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <project xmlns="http://maven.apache.org/POM/4.0.0">
+                <modelVersion>4.0.0</modelVersion>
+                <groupId>modjars</groupId>
+                <artifactId>$jarBaseName</artifactId>
+                <version>local</version>
+            </project>
+            """.trimIndent()
+        )
+    }
+
+    return "modjars:$jarBaseName:local"
+}
+
+//Builds a "real" sources jar containing only .kt/.java/.kts entries copied out of the mod jar,
+//discarding the .class entries. A straight copy of the whole jar technically also satisfies the
+//"-sources.jar" naming convention and works fine for Java classes (IntelliJ's Java decompiler
+//navigation matches by filename regardless of what else is in the jar), but the Kotlin plugin's
+//library-source resolution appears to fall back to the compiled stub when it finds .class files
+//sitting in what's supposed to be a pure source root. Filtering them out fixes that.
+fun extractSourceEntriesOnly(srcJar: File, dstJar: File) {
+    val sourceExtensions = setOf("kt", "java", "kts")
+    ZipFile(srcJar).use { zip ->
+        ZipOutputStream(dstJar.outputStream().buffered()).use { out ->
+            zip.entries().asSequence()
+                .filter { entry -> !entry.isDirectory && entry.name.substringAfterLast('.', "") in sourceExtensions }
+                .forEach { entry ->
+                    out.putNextEntry(ZipEntry(entry.name))
+                    zip.getInputStream(entry).use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+        }
+    }
 }
 
 fun DependencyHandler.addCompileOnlyJar(path: String) {
