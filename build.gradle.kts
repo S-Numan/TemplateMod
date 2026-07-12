@@ -90,6 +90,12 @@ val javaVersion = 17
 /// BUILD PIPELINE
 /// In Most cases, you should not need to change anything below here.
 
+//Local Maven repo where mod-dependency jars get staged, along with a matching "-sources.jar"
+//(see stageModDependency / addModJars below). Declared up here (rather than next to docsRepoDir)
+//because it needs to be initialized before the dependencies{} block runs, which happens earlier
+//in this file.
+val modDepsRepoDir = layout.buildDirectory.dir("modDepsRepo").get().asFile
+
 dependencies {
     addModJars(modDependencies)
     otherDependencies.forEach { addCompileOnlyJar(it) }
@@ -152,12 +158,6 @@ idea {
         testOutputDir = file("build/idea-out/test")
     }
 }
-
-//Local Maven repo where mod-dependency jars get staged, along with a matching "-sources.jar"
-//(see stageModDependency / addModJars below). Declared up here (rather than next to docsRepoDir)
-//because it needs to be initialized before the dependencies{} block runs, which happens earlier
-//in this file.
-val modDepsRepoDir = layout.buildDirectory.dir("modDepsRepo").get().asFile
 
 repositories {
     // Use Maven Central for resolving dependencies.
@@ -268,7 +268,7 @@ fun stageModDependency(jarFile: File): String {
     }
 
     if (!pomFile.exists()) {
-        pomFile.writeIfChanged(
+        pomFile.writeText(
             """
             <?xml version="1.0" encoding="UTF-8"?>
             <project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -291,18 +291,24 @@ fun stageModDependency(jarFile: File): String {
 //library-source resolution appears to fall back to the compiled stub when it finds .class files
 //sitting in what's supposed to be a pure source root. Filtering them out fixes that.
 fun extractSourceEntriesOnly(srcJar: File, dstJar: File) {
-    val sourceExtensions = setOf("kt", "java", "kts")
-    ZipFile(srcJar).use { zip ->
-        ZipOutputStream(dstJar.outputStream().buffered()).use { out ->
-            zip.entries().asSequence()
-                .filter { entry -> !entry.isDirectory && entry.name.substringAfterLast('.', "") in sourceExtensions }
-                .forEach { entry ->
-                    out.putNextEntry(ZipEntry(entry.name))
-                    zip.getInputStream(entry).use { it.copyTo(out) }
-                    out.closeEntry()
-                }
-        }
+    val extractDir = File(dstJar.parentFile, "${dstJar.nameWithoutExtension}-tmp")
+    extractDir.deleteRecursively()
+
+    project.copy {
+        from(zipTree(srcJar))
+        into(extractDir)
+        include("**/*.kt", "**/*.java", "**/*.kts")
     }
+
+    dstJar.delete()
+    ant.withGroovyBuilder {
+        "zip"(
+        "destfile" to dstJar.absolutePath,
+        "basedir" to extractDir.absolutePath
+        )
+    }
+
+    extractDir.deleteRecursively()
 }
 
 fun DependencyHandler.addCompileOnlyJar(path: String) {
