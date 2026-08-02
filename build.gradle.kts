@@ -75,7 +75,10 @@ val devResolution = "1920x1080"
 //Java version to use. Should be 17, as it is what starsector itself uses.
 val javaVersion = 17
 
-
+//When set to true, .java and .kt source files will be bundled with your jar. This will provide people
+//with real javadocs/comments when viewing things from your mod within their IDE. Does increase the jar size.
+//You should set this to "true" if you expect other people to add your mod as a dependency
+val isLibrary = false
 
 
 
@@ -89,6 +92,11 @@ val javaVersion = 17
 
 /// BUILD PIPELINE
 /// In Most cases, you should not need to change anything below here.
+
+
+
+
+
 
 //Local Maven repo where mod-dependency jars get staged, along with a matching "-sources.jar"
 //(see stageModDependency / addModJars below). Declared up here (rather than next to docsRepoDir)
@@ -192,6 +200,15 @@ sourceSets {
     }
 }
 
+//Build in parameter names, in case another mod needs to check out the code without having source access.
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerArgs.add("-parameters")
+}
+kotlin {
+    compilerOptions {
+        javaParameters = true
+    }
+}
 
 tasks.test {
     enabled = false
@@ -200,6 +217,14 @@ tasks.test {
 tasks.jar {
     destinationDirectory.set(file("$rootDir/jars"))
     archiveFileName.set(jarName)
+
+    if (isLibrary) {
+        //Includes the .java and .kt sources for documentation detection
+        from(sourceSets.main.get().allSource) {
+            include("**/*.java", "**/*.kt")
+        }
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
 }
 
 fun DependencyHandler.addModJars(jarNames: List<String>) {
@@ -566,21 +591,7 @@ fun parseLauncher(): StarsectorLaunchSpec {
 }
 
 val launcherInfo by lazy { starsectorLayout() to parseLauncher() }
-
-//JetBrains Runtime, downloaded on demand via the foojay resolver (see settings.gradle.kts).
-//Used in place of the bundled Starsector JRE for these tasks so an attached debugger can
-//redefine classes with structural changes (added/removed methods, including lambdas).
-//Requires the -XX:+AllowEnhancedClassRedefinition vmparams flag to be set.
-val jbrLauncher = javaToolchains.launcherFor {
-    languageVersion = JavaLanguageVersion.of(javaVersion)
-    vendor = JvmVendorSpec.JETBRAINS
-}
-
-//AllowEnhancedClassRedefinition requires Serial or G1 GC, but Starsector's vmparams
-//configures Shenandoah. Drop the Shenandoah-specific flags so JBR falls back to its
-//default (G1). Only affects these gradle tasks; the in-game launcher (vmparams) is
-//untouched, so normal runs still use Shenandoah.
-fun List<String>.forJbr(): List<String> = filterNot { it.contains("Shenandoah") || it.contains("PrintCodeCache") }
+fun List<String>.filteredArgs(): List<String> = filterNot { it.contains("PrintCodeCache") }
 
 //Builds the mod jar, then runs Starsector using the same classpath/jvmArgs the launcher would use.
 tasks.register<JavaExec>("runStarsector") {
@@ -589,15 +600,13 @@ tasks.register<JavaExec>("runStarsector") {
     dependsOn(tasks.jar)
 
     val (layout, parsed) = launcherInfo
-    javaLauncher.set(jbrLauncher)
+    setExecutable(layout.javaExecutable.absolutePath)
     workingDir = layout.gameWorkingDir
     mainClass.set(parsed.mainClass)
     classpath = files(parsed.classpath)
     //Stops treating game-crashes as build errors
     isIgnoreExitValue = true
-    jvmArgs = listOf(
-        "-XX:+AllowEnhancedClassRedefinition",
-    ) + parsed.jvmArgs.forJbr()
+    jvmArgs = parsed.jvmArgs.filteredArgs()
 }
 
 //Same as above, but skips the launcher window and jumps straight in to the game.
@@ -608,18 +617,17 @@ tasks.register<JavaExec>("runStarsectorNoLauncher") {
     dependsOn(tasks.jar)
 
     val (layout, parsed) = launcherInfo
-    javaLauncher.set(jbrLauncher)
+    setExecutable(layout.javaExecutable.absolutePath)
     workingDir = layout.gameWorkingDir
     mainClass.set(parsed.mainClass)
     classpath = files(parsed.classpath)
     isIgnoreExitValue = true
     jvmArgs = listOf(
-        "-XX:+AllowEnhancedClassRedefinition",
         "-DstartRes=$devResolution",
         "-DlaunchDirect=true",
         "-DstartFS=false",
         "-DstartSound=true",
-    ) + parsed.jvmArgs.forJbr()
+    ) + parsed.jvmArgs.filteredArgs()
 }
 
 //Ensure IntelliJ's "Build and run using" stays on IDEA (not Gradle) so HotSwap can recompile
