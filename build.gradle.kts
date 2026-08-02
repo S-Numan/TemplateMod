@@ -1,3 +1,7 @@
+import java.util.zip.ZipFile
+
+
+
 //Automatically points to the starsector folder if the mod is placed in to the "mods" folder.
 //If you do not place the project in to your mods folder, replace this with the path to Starsectors root folder.
 val starsectorPath= "../../";
@@ -265,8 +269,26 @@ fun DependencyHandler.addModJars(jarNames: List<String>) {
     // A jar name could theoretically be found more than once (e.g. present in both the mods
     // folder and the libs folder) - keep only the first match per filename.
     allJarFiles.distinctBy { it.name }.forEach { jarFile ->
-        compileOnly(stageModDependency(jarFile))
+        val notation = stageModDependency(jarFile)
+        compileOnly(notation)
+        if (jarDeclaresAnnotationProcessor(jarFile)) {
+            annotationProcessor(notation)
+        }
     }
+}
+
+//Jars that ship an annotation processor declare it in META-INF/services.
+//Such jars get registered on the annotation processor path too, so javac picks the processor
+//up automatically. Kotlin sources would additionally need the kapt/ksp plugin, this only
+//covers Java compilation.
+fun jarDeclaresAnnotationProcessor(jarFile: File): Boolean {
+    //Track the jar's mtime as a configuration-cache input, so a swapped/updated jar re-runs this check.
+    providers.of(FileMtimeSource::class.java) { parameters.path.set(jarFile.absolutePath) }.get()
+    return runCatching {
+        ZipFile(jarFile).use { zip ->
+            zip.getEntry("META-INF/services/javax.annotation.processing.Processor") != null
+        }
+    }.getOrDefault(false)
 }
 
 //Stages a mod-dependency jar as a local Maven artifact under modDepsRepoDir, so it can be added
@@ -340,12 +362,14 @@ fun DependencyHandler.addCompileOnlyJar(path: String) {
     val jarFile = file(path)
     if (jarFile.exists()) {
         compileOnly(files(jarFile))
+        if (jarDeclaresAnnotationProcessor(jarFile)) annotationProcessor(files(jarFile))
         return
     }
     // Fallback: try resolving the same path relative to the libs folder.
     val libsFile = file("$libsFolder/$path")
     if (libsFile.exists()) {
         compileOnly(files(libsFile))
+        if (jarDeclaresAnnotationProcessor(libsFile)) annotationProcessor(files(libsFile))
         return
     }
     logger.error(
