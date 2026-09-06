@@ -1,5 +1,8 @@
 import java.util.zip.ZipFile
-import java.util.concurrent.TimeUnit
+import org.gradle.process.ExecOperations
+import javax.inject.Inject
+import java.io.ByteArrayOutputStream
+import java.io.Serializable
 
 
 /*
@@ -380,28 +383,66 @@ abstract class FileMtimeSource : ValueSource<Long, FileMtimeSource.Parameters> {
     }
 }
 
-//Runs a git command with `dir` as the working directory, giving up after `timeoutSeconds` so a
-//slow/offline network can never hang the build. Returns true on a clean (exit 0) run; any failure
-//(git missing, network down, timeout, non-zero exit) is logged as a warning and swallowed, never
-//thrown, since this is only ever used for a "nice to have" doc refresh.
+//Result of running a git command via GitCommandSource below. Needs to be Serializable since
+//ValueSource results get written into the configuration cache.
+data class GitCommandResult(val exitCode: Int, val output: String) : Serializable {
+    val ok: Boolean get() = exitCode == 0
+}
+
+//Runs `git <args>` in `workingDir` as a Gradle ValueSource with ExecOperations injected. This is
+//the pattern Gradle actually supports for starting external processes during configuration - a raw
+//ProcessBuilder/Runtime.exec call from build script code is exactly what triggers "Starting an
+//external process during configuration time is unsupported" once the configuration cache is on.
+//ExecOperations.exec() has no timeout parameter and blocks until the process exits, so rather than
+//trying to kill a hung process from the Java side, the timeout is enforced by git itself:
+//GIT_TERMINAL_PROMPT=0 stops it from ever blocking on an interactive credential prompt, and
+//http.lowSpeedLimit/http.lowSpeedTime tell git to abort on its own if a transfer stalls.
+abstract class GitCommandSource : ValueSource<GitCommandResult, GitCommandSource.Parameters> {
+    interface Parameters : ValueSourceParameters {
+        val workingDir: Property<File>
+        val args: ListProperty<String>
+        val timeoutSeconds: Property<Long>
+    }
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    override fun obtain(): GitCommandResult {
+        val timeout = parameters.timeoutSeconds.get()
+        val output = ByteArrayOutputStream()
+        val result = execOperations.exec {
+            workingDir = parameters.workingDir.get()
+            commandLine(
+                listOf(
+                    "git",
+                    "-c", "http.lowSpeedLimit=1000",
+                    "-c", "http.lowSpeedTime=$timeout",
+                ) + parameters.args.get()
+            )
+            environment("GIT_TERMINAL_PROMPT", "0")
+            standardOutput = output
+            errorOutput = output
+            isIgnoreExitValue = true
+        }
+        return GitCommandResult(result.exitValue, output.toString().trim())
+    }
+}
+
+//Runs a git command with `dir` as the working directory. Returns true on a clean (exit 0) run; any
+//failure (git missing, network down, a stalled transfer git itself gave up on, non-zero exit) is
+//logged as a warning and swallowed, never thrown, since this is only ever used for a "nice to have"
+//doc refresh.
 fun runGit(dir: File, vararg args: String, timeoutSeconds: Long = 30): Boolean {
     return try {
-        val process = ProcessBuilder(listOf("git") + args)
-            .directory(dir)
-            .redirectErrorStream(true)
-            .start()
-        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
-        if (!finished) {
-            process.destroyForcibly()
-            logger.warn("git ${args.joinToString(" ")} timed out after ${timeoutSeconds}s in $dir, skipping.")
-            return false
+        val result = providers.of(GitCommandSource::class.java) {
+            parameters.workingDir.set(dir)
+            parameters.args.set(args.toList())
+            parameters.timeoutSeconds.set(timeoutSeconds)
+        }.get()
+        if (!result.ok) {
+            //logger.warn("git ${args.joinToString(" ")} in $dir exited ${result.exitCode}: ${result.output}")
         }
-        val ok = process.exitValue() == 0
-        if (!ok) {
-            val output = process.inputStream.bufferedReader().readText().trim()
-            logger.warn("git ${args.joinToString(" ")} in $dir exited ${process.exitValue()}: $output")
-        }
-        ok
+        result.ok
     } catch (e: Exception) {
         logger.warn("Could not run 'git ${args.joinToString(" ")}' - is git installed and on PATH? (${e.message})")
         false
