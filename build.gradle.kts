@@ -1,4 +1,5 @@
 import java.util.zip.ZipFile
+import java.util.concurrent.TimeUnit
 
 
 /*
@@ -24,12 +25,30 @@ val devResolution = gradle.extra["devResolution"] as String
 val javaVersion = gradle.extra["javaVersion"] as Int
 val isLibrary = gradle.extra["isLibrary"] as Boolean
 
-//Path to a local checkout of https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs
-//(e.g. added as a git submodule), relative to this project's root unless absolute.
-//Optional: falls back to "CommunityApiDocs" so nothing breaks if it's never set in
-//settings.gradle.kts, and stageStarsectorApi() below just skips the swap if the folder
-//doesn't exist yet.
-val communityApiDocsPath = gradle.extra["communityApiDocsPath"] as? String ?: "CommunityApiDocs"
+//Everything below configures the CommunityApiDocs (https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs)
+//integration. All optional/defaulted, so nothing needs to change in settings.gradle.kts unless
+//you want to override one of these.
+//
+//Where it's checked out. Defaults to a spot under build/ (disposable, doesn't need to be
+//gitignored separately, and Gradle is free to fully own its lifecycle there - see
+//ensureCommunityApiDocsCheckedOut() below). Point this elsewhere (e.g. a path you manage yourself)
+//and set communityApiDocsAutoUpdate = false if you'd rather manage the checkout by hand.
+val communityApiDocsPath: File = //(gradle.extra["communityApiDocsPath"] as? String)?.let { file(it) } ?:
+    layout.buildDirectory.dir("communityApiDocs").get().asFile
+
+//Where to clone it from.
+val communityApiDocsRepoUrl: String = //gradle.extra["communityApiDocsRepoUrl"] as? String ?:
+    "https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs.git"
+
+//Set to false to stop Gradle from ever touching the network for this; it will just use whatever
+//(if anything) is already sitting at communityApiDocsPath.
+val communityApiDocsAutoUpdate: Boolean = //gradle.extra["communityApiDocsAutoUpdate"] as? Boolean ?:
+    true
+
+//How often (in hours) to re-check for updates. Checks are throttled by a marker file's mtime, so
+//most Gradle syncs don't pay for a network round-trip at all. Set to 0 to check every time.
+val communityApiDocsUpdateIntervalHours: Long = //(gradle.extra["communityApiDocsUpdateIntervalHours"] as? Number)?.toLong() ?:
+    24L
 
 
 
@@ -377,6 +396,97 @@ abstract class FileMtimeSource : ValueSource<Long, FileMtimeSource.Parameters> {
     }
 }
 
+//Runs a git command with `dir` as the working directory, giving up after `timeoutSeconds` so a
+//slow/offline network can never hang the build. Returns true on a clean (exit 0) run; any failure
+//(git missing, network down, timeout, non-zero exit) is logged as a warning and swallowed, never
+//thrown, since this is only ever used for a "nice to have" doc refresh.
+fun runGit(dir: File, vararg args: String, timeoutSeconds: Long = 30): Boolean {
+    return try {
+        val process = ProcessBuilder(listOf("git") + args)
+            .directory(dir)
+            .redirectErrorStream(true)
+            .start()
+        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            logger.warn("git ${args.joinToString(" ")} timed out after ${timeoutSeconds}s in $dir, skipping.")
+            return false
+        }
+        val ok = process.exitValue() == 0
+        if (!ok) {
+            val output = process.inputStream.bufferedReader().readText().trim()
+            logger.warn("git ${args.joinToString(" ")} in $dir exited ${process.exitValue()}: $output")
+        }
+        ok
+    } catch (e: Exception) {
+        logger.warn("Could not run 'git ${args.joinToString(" ")}' - is git installed and on PATH? (${e.message})")
+        false
+    }
+}
+
+//Makes sure CommunityApiDocs is present at communityApiDocsPath and, if communityApiDocsAutoUpdate
+//is on, reasonably fresh - without ever blocking the build on the network. Always does a full
+//shallow re-clone into a temp folder and swaps it in atomically, rather than `git pull`, so there's
+//no dealing with detached HEADs, diverged history, or merge conflicts: whatever's on the remote's
+//default branch simply replaces what's on disk. Checks are throttled via a marker file's mtime so
+//most Gradle syncs skip the network entirely.
+//Returns the .../src folder to use as the sources-jar content, or null if there isn't one
+//(auto-update disabled and nothing checked out yet, or the clone/update failed with nothing to fall
+//back on).
+fun ensureCommunityApiDocsCheckedOut(): File? {
+    val srcDir = File(communityApiDocsPath, "src")
+
+    if (!communityApiDocsAutoUpdate) {
+        return srcDir.takeIf { it.exists() }
+    }
+
+    val markerFile = File(communityApiDocsPath.parentFile, "${communityApiDocsPath.name}.last-checked")
+    val intervalMs = communityApiDocsUpdateIntervalHours * 3_600_000L
+    val needsCheck = !srcDir.exists() ||
+            !markerFile.exists() ||
+            System.currentTimeMillis() - markerFile.lastModified() >= intervalMs
+
+    if (needsCheck) {
+        logger.lifecycle(
+            if (srcDir.exists()) "Checking CommunityApiDocs for updates..."
+            else "Cloning CommunityApiDocs into $communityApiDocsPath ..."
+        )
+
+        communityApiDocsPath.parentFile?.mkdirs()
+        val freshDir = File(communityApiDocsPath.parentFile, "${communityApiDocsPath.name}.tmp")
+        freshDir.deleteRecursively()
+
+        val cloned = runGit(
+            communityApiDocsPath.parentFile ?: file("."),
+            "clone", "--depth", "1", communityApiDocsRepoUrl, freshDir.absolutePath,
+            timeoutSeconds = 120,
+        )
+
+        if (cloned) {
+            communityApiDocsPath.deleteRecursively()
+            if (!freshDir.renameTo(communityApiDocsPath)) {
+                //Fall back to copy+delete in case the rename crosses a filesystem boundary.
+                freshDir.copyRecursively(communityApiDocsPath, overwrite = true)
+                freshDir.deleteRecursively()
+            }
+            markerFile.parentFile?.mkdirs()
+            markerFile.writeText(System.currentTimeMillis().toString())
+        } else {
+            freshDir.deleteRecursively()
+            if (!srcDir.exists()) {
+                logger.warn(
+                    "Could not clone CommunityApiDocs (offline, or git isn't installed?). " +
+                            "Falling back to vanilla Starsector API sources for hover docs."
+                )
+            } else {
+                logger.warn("Could not update CommunityApiDocs; using the existing local checkout.")
+            }
+        }
+    }
+
+    return srcDir.takeIf { it.exists() }
+}
+
 //Stages the Starsector API as a local Maven repo under build/starsector-api/.
 //Using a maven layout (not flatDir) because IntelliJ only reliably attaches sources when the
 //artifact has a POM and follows the standard "<name>-<version>-sources.jar" classifier convention.
@@ -385,12 +495,12 @@ abstract class FileMtimeSource : ValueSource<Long, FileMtimeSource.Parameters> {
 //extract + repack.
 //
 //The "-sources.jar" content itself comes from one of two places:
-//  - If communityApiDocsPath/src exists (i.e. the CommunityApiDocs submodule is checked out),
-//    that folder is zipped up and used as the sources jar instead of Starsector's own, mostly
-//    undocumented starfarer.api.zip. IntelliJ's Quick Documentation / hover popup then shows the
-//    community-written Javadoc instead of the vanilla (often empty) comments.
-//  - Otherwise it falls back to starfarer.api.zip, same as before, so the build still works for
-//    anyone who hasn't cloned CommunityApiDocs.
+//  - CommunityApiDocs (see ensureCommunityApiDocsCheckedOut() above), auto-cloned/updated under
+//    communityApiDocsPath. If present, that folder is zipped up and used as the sources jar
+//    instead of Starsector's own, mostly undocumented starfarer.api.zip. IntelliJ's Quick
+//    Documentation / hover popup then shows the community-written Javadoc instead.
+//  - Otherwise (auto-update disabled and nothing checked out, or the clone failed with no
+//    prior copy to fall back on) it falls back to starfarer.api.zip, same as the original setup.
 //Runs at configuration time so the files exist before Gradle resolves dependencies (including IDE sync).
 fun stageStarsectorApi(): File {
     val repoDir = layout.buildDirectory.dir("starsector-api").get().asFile
@@ -399,7 +509,9 @@ fun stageStarsectorApi(): File {
 
     val srcJar = File(coreDir, "starfarer.api.jar")
     val srcZip = File(coreDir, "starfarer.api.zip")
-    val communityDocsSrc = file(communityApiDocsPath).resolve("src")
+    //This is what actually clones/updates CommunityApiDocs (subject to the throttle/interval),
+    //so it needs to run before the freshness checks below, not just resolve a path.
+    val communityDocsSrc = ensureCommunityApiDocsCheckedOut()
     val dstJar = File(artifactDir, "starfarer-api-local.jar")
     val dstSources = File(artifactDir, "starfarer-api-local-sources.jar")
     val pomFile = File(artifactDir, "starfarer-api-local.pom")
@@ -415,13 +527,10 @@ fun stageStarsectorApi(): File {
                 "Check starsectorPath at the top of this build script."
     }
 
-    val useCommunityDocs = communityDocsSrc.exists()
+    val useCommunityDocs = communityDocsSrc != null
 
-    //Newest mtime across every file under CommunityApiDocs/src. Not routed through the
-    //FileMtimeSource/ValueSource trick above (that only tracks single files), so with the
-    //configuration cache enabled a `git pull` inside CommunityApiDocs may not by itself
-    //invalidate the cache - run with `--rerun-tasks` once, or delete build/starsector-api,
-    //after updating the submodule if edits don't seem to show up.
+    //Newest mtime across every file under CommunityApiDocs/src, so a freshly re-cloned copy
+    //(different content, same folder) is always detected as newer than a stale sources jar.
     val communityDocsMtime = if (useCommunityDocs) {
         communityDocsSrc.walkTopDown().filter { it.isFile }.maxOfOrNull { it.lastModified() } ?: 0L
     } else 0L
