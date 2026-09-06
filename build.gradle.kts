@@ -24,6 +24,13 @@ val devResolution = gradle.extra["devResolution"] as String
 val javaVersion = gradle.extra["javaVersion"] as Int
 val isLibrary = gradle.extra["isLibrary"] as Boolean
 
+//Path to a local checkout of https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs
+//(e.g. added as a git submodule), relative to this project's root unless absolute.
+//Optional: falls back to "CommunityApiDocs" so nothing breaks if it's never set in
+//settings.gradle.kts, and stageStarsectorApi() below just skips the swap if the folder
+//doesn't exist yet.
+val communityApiDocsPath = gradle.extra["communityApiDocsPath"] as? String ?: "CommunityApiDocs"
+
 
 
 
@@ -373,8 +380,17 @@ abstract class FileMtimeSource : ValueSource<Long, FileMtimeSource.Parameters> {
 //Stages the Starsector API as a local Maven repo under build/starsector-api/.
 //Using a maven layout (not flatDir) because IntelliJ only reliably attaches sources when the
 //artifact has a POM and follows the standard "<name>-<version>-sources.jar" classifier convention.
-//A jar IS a zip with optional manifest, so the source side is just a copy with the right filename.
-//If you ever hit a zip layout IntelliJ does not like, swap the copy for a real extract + repack.
+//A jar IS a zip with optional manifest, so the source side is just a copy (or a re-zip) with the
+//right filename. If you ever hit a zip layout IntelliJ does not like, swap the copy for a real
+//extract + repack.
+//
+//The "-sources.jar" content itself comes from one of two places:
+//  - If communityApiDocsPath/src exists (i.e. the CommunityApiDocs submodule is checked out),
+//    that folder is zipped up and used as the sources jar instead of Starsector's own, mostly
+//    undocumented starfarer.api.zip. IntelliJ's Quick Documentation / hover popup then shows the
+//    community-written Javadoc instead of the vanilla (often empty) comments.
+//  - Otherwise it falls back to starfarer.api.zip, same as before, so the build still works for
+//    anyone who hasn't cloned CommunityApiDocs.
 //Runs at configuration time so the files exist before Gradle resolves dependencies (including IDE sync).
 fun stageStarsectorApi(): File {
     val repoDir = layout.buildDirectory.dir("starsector-api").get().asFile
@@ -383,6 +399,7 @@ fun stageStarsectorApi(): File {
 
     val srcJar = File(coreDir, "starfarer.api.jar")
     val srcZip = File(coreDir, "starfarer.api.zip")
+    val communityDocsSrc = file(communityApiDocsPath).resolve("src")
     val dstJar = File(artifactDir, "starfarer-api-local.jar")
     val dstSources = File(artifactDir, "starfarer-api-local-sources.jar")
     val pomFile = File(artifactDir, "starfarer-api-local.pom")
@@ -398,9 +415,24 @@ fun stageStarsectorApi(): File {
                 "Check starsectorPath at the top of this build script."
     }
 
+    val useCommunityDocs = communityDocsSrc.exists()
+
+    //Newest mtime across every file under CommunityApiDocs/src. Not routed through the
+    //FileMtimeSource/ValueSource trick above (that only tracks single files), so with the
+    //configuration cache enabled a `git pull` inside CommunityApiDocs may not by itself
+    //invalidate the cache - run with `--rerun-tasks` once, or delete build/starsector-api,
+    //after updating the submodule if edits don't seem to show up.
+    val communityDocsMtime = if (useCommunityDocs) {
+        communityDocsSrc.walkTopDown().filter { it.isFile }.maxOfOrNull { it.lastModified() } ?: 0L
+    } else 0L
+
     //Fast path: staged files match (or post-date) their sources, so we can return without doing anything.
     val jarFresh = dstJar.exists() && dstJar.lastModified() >= srcJar.lastModified()
-    val sourcesFresh = !srcZip.exists() || (dstSources.exists() && dstSources.lastModified() >= srcZip.lastModified())
+    val sourcesFresh = if (useCommunityDocs) {
+        dstSources.exists() && dstSources.lastModified() >= communityDocsMtime
+    } else {
+        !srcZip.exists() || (dstSources.exists() && dstSources.lastModified() >= srcZip.lastModified())
+    }
     if (jarFresh && sourcesFresh && pomFile.exists()) return repoDir
 
     artifactDir.mkdirs()
@@ -414,7 +446,20 @@ fun stageStarsectorApi(): File {
     }
 
     stageIfStale(srcJar, dstJar)
-    stageIfStale(srcZip, dstSources)
+
+    if (useCommunityDocs) {
+        if (!sourcesFresh) {
+            dstSources.delete()
+            ant.withGroovyBuilder {
+                "zip"(
+                    "destfile" to dstSources.absolutePath,
+                    "basedir" to communityDocsSrc.absolutePath
+                )
+            }
+        }
+    } else {
+        stageIfStale(srcZip, dstSources)
+    }
 
     //Minimal POM. Gradle's maven resolver needs one to recognise the artifact and to look up the -sources classifier.
     if (!pomFile.exists()) {
