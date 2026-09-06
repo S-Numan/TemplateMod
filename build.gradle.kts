@@ -409,16 +409,19 @@ fun runGit(dir: File, vararg args: String, timeoutSeconds: Long = 30): Boolean {
 }
 
 //Makes sure CommunityApiDocs is present at communityApiDocsPath and, if communityApiDocsAutoUpdate
-//is on, reasonably fresh - without ever blocking the build on the network. Always does a full
-//shallow re-clone into a temp folder and swaps it in atomically, rather than `git pull`, so there's
-//no dealing with detached HEADs, diverged history, or merge conflicts: whatever's on the remote's
-//default branch simply replaces what's on disk. Checks are throttled via a marker file's mtime so
-//most Gradle syncs skip the network entirely.
+//is on, reasonably fresh - without ever blocking the build on the network. Only the very first
+//check does a full (shallow) clone; every check after that just fetches the new tip commit and
+//resets the working tree to it, so updates cost roughly "one commit's worth of data" instead of
+//the whole repo again. Uses fetch+reset rather than `git pull` so there's nothing to go wrong with
+//detached HEADs or diverged history - there are never local commits here worth preserving, so the
+//working tree is simply forced to match the remote's default branch. Checks are throttled via a
+//marker file's mtime so most Gradle syncs skip the network entirely.
 //Returns the .../src folder to use as the sources-jar content, or null if there isn't one
-//(auto-update disabled and nothing checked out yet, or the clone/update failed with nothing to fall
+//(auto-update disabled and nothing checked out yet, or the clone/fetch failed with nothing to fall
 //back on).
 fun ensureCommunityApiDocsCheckedOut(): File? {
     val srcDir = File(communityApiDocsPath, "src")
+    val gitDir = File(communityApiDocsPath, ".git")
 
     if (!communityApiDocsAutoUpdate) {
         return srcDir.takeIf { it.exists() }
@@ -430,12 +433,13 @@ fun ensureCommunityApiDocsCheckedOut(): File? {
             !markerFile.exists() ||
             System.currentTimeMillis() - markerFile.lastModified() >= intervalMs
 
-    if (needsCheck) {
-        logger.lifecycle(
-            if (srcDir.exists()) "Checking CommunityApiDocs for updates..."
-            else "Cloning CommunityApiDocs into $communityApiDocsPath ..."
-        )
+    if (!needsCheck) return srcDir.takeIf { it.exists() }
 
+    if (!gitDir.exists()) {
+        //First time only: a full (but still shallow, --depth 1) clone. Cloned into a temp folder
+        //and swapped in atomically so a build interrupted mid-clone never leaves a half-checked-out
+        //repo behind for the next run to trip over.
+        logger.lifecycle("Cloning CommunityApiDocs into $communityApiDocsPath ...")
         communityApiDocsPath.parentFile?.mkdirs()
         val freshDir = File(communityApiDocsPath.parentFile, "${communityApiDocsPath.name}.tmp")
         freshDir.deleteRecursively()
@@ -443,7 +447,7 @@ fun ensureCommunityApiDocsCheckedOut(): File? {
         val cloned = runGit(
             communityApiDocsPath.parentFile ?: file("."),
             "clone", "--depth", "1", communityApiDocsRepoUrl, freshDir.absolutePath,
-            timeoutSeconds = 60,
+            timeoutSeconds = 120,
         )
 
         if (cloned) {
@@ -457,14 +461,24 @@ fun ensureCommunityApiDocsCheckedOut(): File? {
             markerFile.writeText(System.currentTimeMillis().toString())
         } else {
             freshDir.deleteRecursively()
-            if (!srcDir.exists()) {
-                logger.warn(
-                    "Could not clone CommunityApiDocs (offline, or git isn't installed?). " +
-                            "Falling back to vanilla Starsector API sources for hover docs."
-                )
-            } else {
-                logger.warn("Could not update CommunityApiDocs; using the existing local checkout.")
-            }
+            logger.warn(
+                "Could not clone CommunityApiDocs (offline, or git isn't installed?). " +
+                        "Falling back to vanilla Starsector API sources for hover docs."
+            )
+        }
+    } else {
+        //Already cloned: fetch just the new tip commit - `--depth 1` clones set up a single-branch
+        //tracking config, so this pulls down only what changed, not the whole repo - then force the
+        //working tree to match it. `origin/HEAD` is the symbolic ref git points at the remote's
+        //default branch at clone time, so this tracks that branch without hardcoding "main" vs
+        //"master".
+        logger.lifecycle("Fetching CommunityApiDocs updates...")
+        val fetched = runGit(communityApiDocsPath, "fetch", "--depth", "1", "origin", timeoutSeconds = 60)
+        if (fetched && runGit(communityApiDocsPath, "reset", "--hard", "origin/HEAD", timeoutSeconds = 30)) {
+            markerFile.parentFile?.mkdirs()
+            markerFile.writeText(System.currentTimeMillis().toString())
+        } else {
+            logger.warn("Could not check CommunityApiDocs for updates; using the existing local checkout.")
         }
     }
 
@@ -495,8 +509,7 @@ fun stageStarsectorApi(): File {
     val srcZip = File(coreDir, "starfarer.api.zip")
     //This is what actually clones/updates CommunityApiDocs (subject to the throttle/interval),
     //so it needs to run before the freshness checks below, not just resolve a path.
-    val communityDocsSrc = if(!useCommunityApiDocs) null
-    else ensureCommunityApiDocsCheckedOut()
+    val communityDocsSrc: File? = if (useCommunityApiDocs) ensureCommunityApiDocsCheckedOut() else null
     val dstJar = File(artifactDir, "starfarer-api-local.jar")
     val dstSources = File(artifactDir, "starfarer-api-local-sources.jar")
     val pomFile = File(artifactDir, "starfarer-api-local.pom")

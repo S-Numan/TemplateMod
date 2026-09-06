@@ -81,7 +81,7 @@ val javaVersion = 17
 val isLibrary = false
 
 
-//Community API Docs
+//Community API Docs. Note that downloading the community api docs requires git to be installed on your system.
 //If the community api docs at https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs should be setup and used for documentation.
 val useCommunityApiDocs = true
 
