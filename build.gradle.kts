@@ -25,30 +25,14 @@ val devResolution = gradle.extra["devResolution"] as String
 val javaVersion = gradle.extra["javaVersion"] as Int
 val isLibrary = gradle.extra["isLibrary"] as Boolean
 
-//Everything below configures the CommunityApiDocs (https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs)
-//integration. All optional/defaulted, so nothing needs to change in settings.gradle.kts unless
-//you want to override one of these.
-//
-//Where it's checked out. Defaults to a spot under build/ (disposable, doesn't need to be
-//gitignored separately, and Gradle is free to fully own its lifecycle there - see
-//ensureCommunityApiDocsCheckedOut() below). Point this elsewhere (e.g. a path you manage yourself)
-//and set communityApiDocsAutoUpdate = false if you'd rather manage the checkout by hand.
-val communityApiDocsPath: File = //(gradle.extra["communityApiDocsPath"] as? String)?.let { file(it) } ?:
+val useCommunityApiDocs: Boolean = gradle.extra["useCommunityApiDocs"] as Boolean
+val communityApiDocsPath: File = (gradle.extra["communityApiDocsPath"] as? String)?.let { file(it) } ?:
     layout.buildDirectory.dir("communityApiDocs").get().asFile
-
-//Where to clone it from.
-val communityApiDocsRepoUrl: String = //gradle.extra["communityApiDocsRepoUrl"] as? String ?:
-    "https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs.git"
-
-//Set to false to stop Gradle from ever touching the network for this; it will just use whatever
-//(if anything) is already sitting at communityApiDocsPath.
-val communityApiDocsAutoUpdate: Boolean = //gradle.extra["communityApiDocsAutoUpdate"] as? Boolean ?:
-    true
-
+val communityApiDocsRepoUrl: String = gradle.extra["communityApiDocsRepoUrl"] as String
+val communityApiDocsAutoUpdate: Boolean = gradle.extra["communityApiDocsAutoUpdate"] as Boolean
 //How often (in hours) to re-check for updates. Checks are throttled by a marker file's mtime, so
 //most Gradle syncs don't pay for a network round-trip at all. Set to 0 to check every time.
-val communityApiDocsUpdateIntervalHours: Long = //(gradle.extra["communityApiDocsUpdateIntervalHours"] as? Number)?.toLong() ?:
-    24L
+val communityApiDocsUpdateIntervalHours: Long = 24L
 
 
 
@@ -459,7 +443,7 @@ fun ensureCommunityApiDocsCheckedOut(): File? {
         val cloned = runGit(
             communityApiDocsPath.parentFile ?: file("."),
             "clone", "--depth", "1", communityApiDocsRepoUrl, freshDir.absolutePath,
-            timeoutSeconds = 120,
+            timeoutSeconds = 60,
         )
 
         if (cloned) {
@@ -511,7 +495,8 @@ fun stageStarsectorApi(): File {
     val srcZip = File(coreDir, "starfarer.api.zip")
     //This is what actually clones/updates CommunityApiDocs (subject to the throttle/interval),
     //so it needs to run before the freshness checks below, not just resolve a path.
-    val communityDocsSrc = ensureCommunityApiDocsCheckedOut()
+    val communityDocsSrc = if(!useCommunityApiDocs) null
+    else ensureCommunityApiDocsCheckedOut()
     val dstJar = File(artifactDir, "starfarer-api-local.jar")
     val dstSources = File(artifactDir, "starfarer-api-local-sources.jar")
     val pomFile = File(artifactDir, "starfarer-api-local.pom")
