@@ -390,15 +390,6 @@ data class GitCommandResult(val exitCode: Int, val output: String) {
 //Everything involved in keeping CommunityApiDocs in sync lives inside this one ValueSource's
 //obtain(): the interval throttle, the initial clone, and the incremental fetch+reset.
 //
-//This used to be split across ordinary build-script functions that called a small git-running
-//ValueSource only for the actual process start. That fixed the configuration-cache's "external
-//process" restriction, but not a subtler problem: with the configuration cache enabled, a *hit*
-//skips re-running build script code entirely, and none of our throttle/clone/fetch logic lived
-//anywhere Gradle knew to re-check. ValueSource.obtain() is different - Gradle guarantees it gets
-//invoked again at the start of every build specifically to check whether its result changed, even
-//when it's about to reuse a cached configuration for everything else. That's the one place this
-//logic can live and actually run on a schedule instead of only on a cache miss.
-//
 //Returns the newest mtime across every file under the checked-out src/ folder, or -1 if there's no
 //usable checkout. That value is also what Gradle compares between builds: it only changes when
 //content actually changed (a fresh clone or a fetch that moved the tip), which is exactly when the
