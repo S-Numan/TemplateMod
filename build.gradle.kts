@@ -387,14 +387,12 @@ data class GitCommandResult(val exitCode: Int, val output: String) {
     val ok: Boolean get() = exitCode == 0
 }
 
-//Everything involved in keeping CommunityApiDocs in sync lives inside this one ValueSource's
-//obtain(): the interval throttle, the initial clone, and the incremental fetch+reset.
-//
-//Returns the newest mtime across every file under the checked-out src/ folder, or -1 if there's no
-//usable checkout. That value is also what Gradle compares between builds: it only changes when
-//content actually changed (a fresh clone or a fetch that moved the tip), which is exactly when the
-//rest of the build needs to know to rebuild the sources jar - and it staying the same is what lets
-//Gradle skip everything else on a cache hit once the interval hasn't elapsed.
+//Keeps CommunityApiDocs checked out and (subject to the interval throttle) up to date.
+//Runs inside obtain() rather than plain build-script code because Gradle re-invokes obtain() on
+//every build - even on a configuration-cache hit - to check whether the result changed. That's
+//what makes the interval actually fire on a schedule instead of only on a cache miss.
+//Returns the newest mtime under src/, or -1 if there's no usable checkout. Gradle also uses this
+//return value to decide whether anything downstream needs to be rebuilt.
 abstract class CommunityApiDocsSyncSource : ValueSource<Long, CommunityApiDocsSyncSource.Parameters> {
     interface Parameters : ValueSourceParameters {
         val repoPath: Property<File>
@@ -425,9 +423,8 @@ abstract class CommunityApiDocsSyncSource : ValueSource<Long, CommunityApiDocsSy
 
         if (needsCheck) {
             if (!gitDir.exists()) {
-                //First time only: a full (but still shallow, --depth 1) clone. Cloned into a temp
-                //folder and swapped in atomically so a build interrupted mid-clone never leaves a
-                //half-checked-out repo behind for the next run to trip over.
+                //First time only: shallow clone into a temp folder, then swap it in atomically so
+                //an interrupted build never leaves a half-checked-out repo behind.
                 log.lifecycle("Cloning CommunityApiDocs into $repoPath ...")
                 repoPath.parentFile?.mkdirs()
                 val freshDir = File(repoPath.parentFile, "${repoPath.name}.tmp")
@@ -452,18 +449,14 @@ abstract class CommunityApiDocsSyncSource : ValueSource<Long, CommunityApiDocsSy
                     freshDir.deleteRecursively()
                     log.warn(
                         result.output.substringAfter('\n') +
-                        "\nCould not clone CommunityApiDocs (offline, or git isn't installed?). " +
-                        "Falling back to vanilla Starsector API sources for hover docs."
+                                "\nCould not clone CommunityApiDocs (offline, or git isn't installed?). " +
+                                "Falling back to vanilla Starsector API sources for hover docs."
                     )
                 }
             } else {
-                //Already cloned: fetch just the new tip commit - `--depth 1` clones set up a
-                //single-branch tracking config, so this pulls down only what changed, not the whole
-                //repo again - then force the working tree to match it. `origin/HEAD` is the symbolic
-                //ref git points at the remote's default branch at clone time, so this tracks that
-                //branch without hardcoding "main" vs "master". Using fetch+reset rather than `git
-                //pull` sidesteps merge/ff-only failures entirely - there are never local commits
-                //here worth preserving.
+                //Already cloned: fetch just the new tip commit and force the working tree to match
+                //it, rather than `git pull`, since there are never local commits worth preserving
+                //here. origin/HEAD tracks whatever the remote's default branch is.
                 log.lifecycle("Fetching CommunityApiDocs updates...")
                 val fetched = runGit(repoPath, "fetch", "--depth", "1", "origin", timeoutSeconds = 60)
                 if (fetched.ok && runGit(repoPath, "reset", "--hard", "origin/HEAD", timeoutSeconds = 30).ok) {
@@ -483,14 +476,10 @@ abstract class CommunityApiDocsSyncSource : ValueSource<Long, CommunityApiDocsSy
         return dir.walkTopDown().filter { it.isFile }.maxOfOrNull { it.lastModified() } ?: -1L
     }
 
-    //Runs `git <args>` in `dir` via ExecOperations - the pattern Gradle actually supports for
-    //starting external processes from configuration-time code (a raw ProcessBuilder/Runtime.exec
-    //call is what triggers "Starting an external process during configuration time is unsupported"
-    //once the configuration cache is on). ExecOperations.exec() has no timeout parameter and blocks
-    //until the process exits, so rather than trying to kill a hung process from the Java side, the
-    //timeout is enforced by git itself: GIT_TERMINAL_PROMPT=0 stops it from ever blocking on an
-    //interactive credential prompt, and http.lowSpeedLimit/http.lowSpeedTime tell git to abort on
-    //its own if a transfer stalls.
+    //Runs `git <args>` in `dir` via ExecOperations, since a raw ProcessBuilder call would trip
+    //the "external process during configuration" restriction. There's no timeout parameter here,
+    //so hangs are bounded on git's side instead: GIT_TERMINAL_PROMPT=0 skips credential prompts,
+    //and http.lowSpeedLimit/Time abort a stalled transfer.
     private fun runGit(dir: File, vararg args: String, timeoutSeconds: Long = 30): GitCommandResult {
         val output = ByteArrayOutputStream()
         val result = execOperations.exec {
@@ -511,10 +500,8 @@ abstract class CommunityApiDocsSyncSource : ValueSource<Long, CommunityApiDocsSy
     }
 }
 
-//Resolves (and, subject to the interval/throttle inside CommunityApiDocsSyncSource, updates)
-//CommunityApiDocs, returning its .../src folder to use as sources-jar content, or null if there
-//isn't one (auto-update disabled and nothing checked out yet, or the clone/fetch failed with
-//nothing to fall back on).
+//Resolves CommunityApiDocs' src/ folder for use as sources-jar content (triggering the
+//clone/update inside CommunityApiDocsSyncSource along the way), or null if there isn't one.
 fun resolveCommunityApiDocsSrc(): File? {
     val mtime = providers.of(CommunityApiDocsSyncSource::class.java) {
         parameters.repoPath.set(communityApiDocsPath)
@@ -525,6 +512,7 @@ fun resolveCommunityApiDocsSrc(): File? {
     if (mtime < 0) return null
     return File(communityApiDocsPath, "src").takeIf { it.exists() }
 }
+
 
 //Stages the Starsector API as a local Maven repo under build/starsector-api/.
 //Using a maven layout (not flatDir) because IntelliJ only reliably attaches sources when the
