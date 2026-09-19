@@ -91,7 +91,7 @@ val useCommunityApiDocs = true
 val communityApiDocsPath = null
 
 //Where to clone the community api docs from.
-val communityApiDocsRepoUrl = "https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs.git"
+val communityApiDocsRepoUrl = "https://github.com/StarsectorCommunityApiDocs/CommunityApiDocs"
 
 //Set to false to stop Gradle from ever touching the network for this; it will just use whatever (if anything) is already sitting at communityApiDocsPath.
 val communityApiDocsAutoUpdate = true
